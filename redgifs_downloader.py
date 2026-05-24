@@ -1,6 +1,6 @@
-# redgifs_downloader.py
 import os
 import asyncio
+import sys  # Added to read command line arguments
 import aiohttp
 from aiohttp import ClientTimeout
 
@@ -34,7 +34,7 @@ async def download_redgifs_from_list(urls, output_dir="downloads", concurrency=5
 
         try:
             async with session.get(api_url, headers=headers) as resp:
-                if resp.status == 401:  # token expired
+                if resp.status == 401:
                     await get_token(session)
                     headers["Authorization"] = f"Bearer {TOKEN}"
                     async with session.get(api_url, headers=headers) as resp_retry:
@@ -66,20 +66,17 @@ async def download_redgifs_from_list(urls, output_dir="downloads", concurrency=5
 
     sem = asyncio.Semaphore(concurrency)
 
-    async def process_slug(session, slug, output_path) -> bool:
-        """Download a single RedGifs video. Returns True on success."""
+    async def process_slug(session, slug, output_path):
         async with sem:
             if os.path.exists(output_path):
                 print(f"Skipping {slug}, already exists")
-                return True
+                return
 
             video_url = await get_video_url(session, slug)
             if video_url:
                 await download_video(session, video_url, output_path)
-                return True
             else:
                 print(f"Could not get video for {slug}")
-                return False
 
     async with aiohttp.ClientSession(timeout=ClientTimeout(total=60)) as session:
         tasks = []
@@ -87,5 +84,26 @@ async def download_redgifs_from_list(urls, output_dir="downloads", concurrency=5
             slug = url.split("/")[-1].split(";")[0].split("#")[0]
             tasks.append(process_slug(session, slug, dest))
 
-        results = await asyncio.gather(*tasks)
-        return results  # list of bool success flags
+        await asyncio.gather(*tasks)
+
+# --- THIS IS THE NEW ENTRY POINT BLOCK ---
+if __name__ == "__main__":
+    # Ensure the user actually passed a URL
+    if len(sys.argv) < 2:
+        print("Usage: python redgifs_downloader.py <URL>")
+        sys.exit(1)
+
+    input_url = sys.argv[1]
+    
+    # Extract the slug name to create a proper filename (e.g., "hopefulhideouskouprey.mp4")
+    slug_name = input_url.split("/")[-1].split(";")[0].split("#")[0]
+    output_directory = "downloads"
+    destination = os.path.join(output_directory, f"{slug_name}.mp4")
+
+    # Format it as a list containing a tuple: [(url, destination_path)]
+    url_list = [(input_url, destination)]
+
+    print(f"Starting download for: {slug_name}...")
+    
+    # Run the asynchronous function loop
+    asyncio.run(download_redgifs_from_list(url_list, output_dir=output_directory))
