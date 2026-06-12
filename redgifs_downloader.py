@@ -3,21 +3,25 @@
 RedGIFs bulk downloader with automatic source folders.
 
 Examples:
-    python redgifs_downloader_improved.py "https://www.redgifs.com/watch/SomeSlug"
-    python redgifs_downloader_improved.py "https://www.redgifs.com/users/someuser" --limit 50
-    python redgifs_downloader_improved.py "https://www.redgifs.com/niches/someniche" --limit 25
-    python redgifs_downloader_with_folders.py "https://www.redgifs.com/search?query=example" --limit 20
+    python redgifs_downloader.py "https://www.redgifs.com/watch/SomeSlug"
+
+    python redgifs_downloader.py "https://www.redgifs.com/users/someuser" --limit 50
+    python redgifs_downloader.py "https://www.redgifs.com/users/someuser" --limit 50 --order top
+
+    python redgifs_downloader.py "https://www.redgifs.com/niches/someniche" --limit 25 --order hot
+
+    python redgifs_downloader.py "https://www.redgifs.com/search?query=example" --limit 20
+    python redgifs_downloader.py "https://www.redgifs.com/search?query=example&order=latest" --limit 20
 
 Default folders:
     - User URL:   downloads/<username>/
     - Niche URL:  downloads/<niche>/
-    - Search/tag: downloads/<tag-or-query>/
+    - Search/tag: downloads/<search_term>/
     - Single URL: downloads/
 
 Notes:
     - Use this only for content you are allowed to download.
-    - RedGIFs may change or restrict its API. If endpoints stop working, the
-      script falls back to scanning links from the supplied page where possible.
+    - RedGIFs may change or restrict its API.
 """
 
 from __future__ import annotations
@@ -38,6 +42,8 @@ from aiohttp import ClientResponseError, ClientTimeout
 BASE_API = "https://api.redgifs.com/v2"
 TOKEN_URL = f"{BASE_API}/auth/temporary"
 
+VALID_ORDERS = ("top", "hot", "latest")
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -47,7 +53,6 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://www.redgifs.com/",
 }
-
 
 WATCH_RE = re.compile(
     r"(?:https?://(?:www\.)?redgifs\.com)?/(?:watch|ifr)/([A-Za-z0-9_-]+)",
@@ -83,15 +88,31 @@ def parse_watch_slug(url_or_slug: str) -> str | None:
     return None
 
 
+def get_order_from_url(input_url: str, fallback: str) -> str:
+    """
+    Read ?order=top, ?order=hot, or ?order=latest from the URL.
+
+    If the URL has no valid order value, use the CLI/default fallback.
+    """
+    parsed = urlparse(input_url)
+    query_values = parse_qs(parsed.query)
+    order = query_values.get("order", [None])[0]
+
+    if order in VALID_ORDERS:
+        return order
+
+    return fallback
+
+
 def infer_collection_folder(input_url: str) -> str | None:
     """
     Return the default subfolder name for collection-style URLs.
 
     Examples:
-        https://www.redgifs.com/users/alice       -> alice
-        https://www.redgifs.com/niches/example    -> example
-        https://www.redgifs.com/search?query=cat  -> cat
-        https://www.redgifs.com/tags/cat          -> cat
+        https://www.redgifs.com/users/alice -> alice
+        https://www.redgifs.com/niches/example -> example
+        https://www.redgifs.com/search?query=cat -> cat
+        https://www.redgifs.com/tags/cat -> cat
 
     Single watch/iframe URLs intentionally return None so they save directly
     into the selected output directory unless --folder is used.
@@ -116,10 +137,10 @@ def infer_collection_folder(input_url: str) -> str | None:
         or query_values.get("search_text", [None])[0]
         or query_values.get("tag", [None])[0]
     )
+
     if search_text:
         return safe_filename(search_text)
 
-    # Last-resort collection folder: use the last path segment for non-watch URLs.
     if path_parts:
         return safe_filename(path_parts[-1])
 
@@ -155,7 +176,6 @@ def get_next_page(payload: dict[str, Any], current_page: int) -> int | None:
         if isinstance(total_pages, int) and current_page < total_pages:
             return current_page + 1
 
-    # Fallback: if a page returned results, optimistically try the next page.
     if extract_gifs(payload):
         return current_page + 1
 
@@ -179,14 +199,20 @@ class RedGifsClient:
         async with self.session.get(TOKEN_URL, headers=HEADERS) as resp:
             resp.raise_for_status()
             data = await resp.json()
-            token = data.get("token")
-            if not token:
-                raise RuntimeError("Temporary token response did not contain a token")
-            self.token = token
-            print(f"Got token: {token[:8]}...")
-            return token
 
-    async def api_get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        token = data.get("token")
+        if not token:
+            raise RuntimeError("Temporary token response did not contain a token")
+
+        self.token = token
+        print(f"Got token: {token[:8]}...")
+        return token
+
+    async def api_get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not self.token:
             await self.get_token()
 
@@ -203,7 +229,11 @@ class RedGifsClient:
 
                     if resp.status == 429:
                         retry_after = resp.headers.get("Retry-After")
-                        wait_for = float(retry_after) if retry_after and retry_after.isdigit() else 2.0 + attempt
+                        wait_for = (
+                            float(retry_after)
+                            if retry_after and retry_after.isdigit()
+                            else 2.0 + attempt
+                        )
                         print(f"Rate limited. Sleeping {wait_for:.1f}s...")
                         await asyncio.sleep(wait_for)
                         continue
@@ -211,7 +241,16 @@ class RedGifsClient:
                     resp.raise_for_status()
                     return await resp.json()
 
-            except ClientResponseError:
+            except ClientResponseError as exc:
+                if exc.status in {500, 502, 503, 504} and attempt < 3:
+                    wait_for = 1.0 + attempt
+                    print(
+                        f"Temporary API error HTTP {exc.status}. "
+                        f"Retrying in {wait_for:.1f}s..."
+                    )
+                    await asyncio.sleep(wait_for)
+                    continue
+
                 raise
 
             if self.delay:
@@ -242,6 +281,7 @@ class RedGifsClient:
 
         while True:
             params["page"] = page
+
             try:
                 payload = await self.api_get(endpoint, params=params)
             except Exception as exc:
@@ -259,6 +299,7 @@ class RedGifsClient:
                     or gif.get("name")
                     or gif.get("gifId")
                 )
+
                 if not slug:
                     urls = gif.get("urls") if isinstance(gif.get("urls"), dict) else {}
                     sd_or_hd = urls.get("hd") or urls.get("sd")
@@ -269,6 +310,7 @@ class RedGifsClient:
                     continue
 
                 slug = str(slug)
+
                 if slug.lower() in seen:
                     continue
 
@@ -276,7 +318,7 @@ class RedGifsClient:
                 found.append(Target(slug=slug))
                 print(f"Found {len(found)}: {slug}")
 
-                if limit and len(found) >= limit:
+                if limit is not None and len(found) >= limit:
                     return found
 
             next_page = get_next_page(payload, page)
@@ -297,7 +339,9 @@ async def scan_page_for_watch_links(
 ) -> list[Target]:
     """
     Fallback crawler: load pages from the supplied RedGIFs URL and extract
-    /watch/<slug> or /ifr/<slug> links. It stays on redgifs.com.
+    /watch/ or /ifr/ links.
+
+    It stays on redgifs.com.
     """
     queue = [start_url]
     visited: set[str] = set()
@@ -306,16 +350,23 @@ async def scan_page_for_watch_links(
 
     while queue and len(visited) < max_pages:
         url = queue.pop(0)
+
         if url in visited:
             continue
+
         visited.add(url)
 
         try:
-            async with session.get(url, headers={**HEADERS, "Accept": "text/html,*/*"}) as resp:
+            async with session.get(
+                url,
+                headers={**HEADERS, "Accept": "text/html,*/*"},
+            ) as resp:
                 if resp.status >= 400:
                     print(f"Skipping page {url}: HTTP {resp.status}")
                     continue
+
                 html = await resp.text(errors="ignore")
+
         except Exception as exc:
             print(f"Could not scan {url}: {exc}")
             continue
@@ -323,23 +374,28 @@ async def scan_page_for_watch_links(
         for match in WATCH_RE.finditer(html):
             slug = match.group(1)
             key = slug.lower()
+
             if key not in seen_slugs:
                 seen_slugs.add(key)
                 targets.append(Target(slug=slug))
                 print(f"Found {len(targets)} by scanning links: {slug}")
 
-                if limit and len(targets) >= limit:
+                if limit is not None and len(targets) >= limit:
                     return targets
 
         for href in re.findall(r"""href=["']([^"']+)["']""", html, flags=re.IGNORECASE):
             next_url = urljoin(url, href)
             parsed = urlparse(next_url)
+
             if parsed.netloc.lower() not in {"redgifs.com", "www.redgifs.com"}:
                 continue
+
             if "/watch/" in parsed.path or "/ifr/" in parsed.path:
                 continue
+
             if any(part in parsed.path for part in ("/users/", "/niches/", "/search")):
                 normalized = parsed._replace(fragment="").geturl()
+
                 if normalized not in visited and normalized not in queue:
                     queue.append(normalized)
 
@@ -353,10 +409,13 @@ async def targets_from_url(
     *,
     limit: int | None,
     max_scan_pages: int,
+    order: str,
 ) -> list[Target]:
     single_slug = parse_watch_slug(input_url)
     if single_slug:
         return [Target(slug=single_slug)]
+
+    order = get_order_from_url(input_url, order)
 
     parsed = urlparse(input_url)
     path_parts = [part for part in parsed.path.split("/") if part]
@@ -367,11 +426,14 @@ async def targets_from_url(
         if idx + 1 < len(path_parts):
             username = path_parts[idx + 1].lower()
             print(f"Detected user page: {username}")
+            print(f"Using order: {order}")
+
             targets = await client.iter_endpoint(
                 f"/users/{quote(username)}/search",
                 limit=limit,
-                extra_params={"order": "new"},
+                extra_params={"order": order},
             )
+
             if targets:
                 return targets
 
@@ -380,11 +442,14 @@ async def targets_from_url(
         if idx + 1 < len(path_parts):
             niche = path_parts[idx + 1]
             print(f"Detected niche page: {niche}")
+            print(f"Using order: {order}")
+
             targets = await client.iter_endpoint(
                 f"/niches/{quote(niche)}/gifs",
                 limit=limit,
-                extra_params={"order": "new"},
+                extra_params={"order": order},
             )
+
             if targets:
                 return targets
 
@@ -394,17 +459,25 @@ async def targets_from_url(
         or query_values.get("q", [None])[0]
         or query_values.get("search_text", [None])[0]
     )
+
     if "search" in lower_parts and search_text:
         print(f"Detected search page: {search_text}")
+        print(f"Using order: {order}")
+
         targets = await client.iter_endpoint(
             "/gifs/search",
             limit=limit,
-            extra_params={"search_text": search_text, "order": "new"},
+            extra_params={
+                "search_text": search_text,
+                "order": order,
+            },
         )
+
         if targets:
             return targets
 
     print("API collection detection did not match or returned nothing; scanning page links...")
+
     return await scan_page_for_watch_links(
         session,
         input_url,
@@ -424,6 +497,7 @@ async def download_file(
 
     async with session.get(url, headers=HEADERS) as resp:
         resp.raise_for_status()
+
         with tmp_path.open("wb") as file:
             async for chunk in resp.content.iter_chunked(chunk_size):
                 if chunk:
@@ -444,26 +518,35 @@ async def download_targets(
     prefer: str,
     make_subfolder: bool,
     folder_override: str | None,
+    order: str,
 ) -> None:
-    folder_name = safe_filename(folder_override) if folder_override else (
-        infer_collection_folder(input_url) if make_subfolder else None
+    folder_name = (
+        safe_filename(folder_override)
+        if folder_override
+        else infer_collection_folder(input_url)
+        if make_subfolder
+        else None
     )
+
     save_dir = output_dir / folder_name if folder_name else output_dir
     save_dir.mkdir(parents=True, exist_ok=True)
-    timeout = ClientTimeout(total=None, sock_connect=30, sock_read=120)
 
+    timeout = ClientTimeout(total=None, sock_connect=30, sock_read=120)
     connector = aiohttp.TCPConnector(limit_per_host=max(concurrency, 1))
+
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         client = RedGifsClient(session, page_size=page_size)
+
         targets = await targets_from_url(
             client,
             session,
             input_url,
             limit=limit,
             max_scan_pages=max_scan_pages,
+            order=order,
         )
 
-        if limit:
+        if limit is not None:
             targets = targets[:limit]
 
         if not targets:
@@ -485,11 +568,13 @@ async def download_targets(
                     return
 
                 info = await client.get_video_info(slug)
+
                 if not info:
                     print(f"Could not get video info for {slug}")
                     return
 
                 urls = info.get("urls") if isinstance(info.get("urls"), dict) else {}
+
                 if prefer == "hd":
                     video_url = urls.get("hd") or urls.get("sd")
                 else:
@@ -512,7 +597,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download one or more RedGIFs videos from a watch/user/niche/search URL.",
     )
+
     parser.add_argument("url", help="RedGIFs watch, user, niche, or search URL")
+
     parser.add_argument(
         "-l",
         "--limit",
@@ -520,12 +607,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="Maximum number of videos to download",
     )
+
     parser.add_argument(
         "-o",
         "--output-dir",
         default="downloads",
         help="Directory to save videos into",
     )
+
     parser.add_argument(
         "--folder",
         default=None,
@@ -534,11 +623,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "Videos will be saved into <output-dir>/<folder>."
         ),
     )
+
     parser.add_argument(
         "--flat",
         action="store_true",
         help="Disable automatic username/tag/niche subfolders and save directly into --output-dir",
     )
+
     parser.add_argument(
         "-c",
         "--concurrency",
@@ -546,29 +637,41 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=5,
         help="Number of concurrent downloads",
     )
+
     parser.add_argument(
         "--page-size",
         type=int,
         default=80,
         help="API page size for collection fetching",
     )
+
     parser.add_argument(
         "--max-scan-pages",
         type=int,
         default=20,
         help="Maximum same-site HTML pages to scan when API detection fails",
     )
+
     parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Re-download files even if they already exist",
     )
+
     parser.add_argument(
         "--prefer",
         choices=("hd", "sd"),
         default="hd",
         help="Prefer HD or SD video URL when both are available",
     )
+
+    parser.add_argument(
+        "--order",
+        choices=VALID_ORDERS,
+        default="latest",
+        help="Sort order for user, niche, and search URLs",
+    )
+
     args = parser.parse_args(argv)
 
     if args.limit is not None and args.limit < 1:
@@ -588,6 +691,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+
     asyncio.run(
         download_targets(
             args.url,
@@ -600,8 +704,10 @@ def main(argv: list[str] | None = None) -> int:
             prefer=args.prefer,
             make_subfolder=not args.flat,
             folder_override=args.folder,
+            order=args.order,
         )
     )
+
     return 0
 
 
