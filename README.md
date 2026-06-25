@@ -2,7 +2,7 @@
 
 A Python command-line downloader for RedGIFs videos.
 
-It supports downloading from single video URLs, user pages, niche pages, search pages, and tag-style URLs. It can automatically create folders based on the source, limit downloads, choose a sort order, prefer HD or SD, skip existing files, overwrite files, and download multiple videos concurrently.
+It supports downloading from single video URLs, user pages, niche pages, search pages, and tag-style URLs. It can automatically create folders based on the source, limit downloads, skip blacklisted tags, choose a sort order, prefer HD or SD, skip existing files, overwrite files, and download multiple videos concurrently.
 
 ## Features
 
@@ -13,6 +13,7 @@ It supports downloading from single video URLs, user pages, niche pages, search 
 - Automatic folder naming
 - Optional flat output mode
 - Concurrent downloads
+- Tag blacklist filtering
 - HD/SD preference
 - Skips existing files by default
 - Optional overwrite mode
@@ -91,6 +92,19 @@ Videos will be saved into:
 
     downloads/example-niche/
 
+### Download from multiple niches
+
+Separate niche slugs or RedGIFs URLs with commas, semicolons, or pipes.
+Each source uses its own automatic folder.
+
+    python redgifs_downloader.py "femboy,futa-on-femboys,shortstack" --limit 100
+
+Videos will be saved into:
+
+    downloads/femboy/
+    downloads/futa-on-femboys/
+    downloads/shortstack/
+
 ### Download from search
 
     python redgifs_downloader.py "https://www.redgifs.com/search?query=example"
@@ -124,6 +138,34 @@ You can also pass the order in the URL:
     python redgifs_downloader.py "https://www.redgifs.com/niches/example-niche?order=top" --limit 50
 
 If both are provided, the URL order takes priority.
+
+### Skip blacklisted tags
+
+Use `--blacklist` to skip any video whose tags contain one of your blacklist terms.
+Skipped videos do not count toward `--limit`, so the downloader keeps fetching later results until the requested number of allowed videos is found or the source runs out.
+
+You can also edit `DEFAULT_BLACKLIST` near the top of `redgifs_downloader.py` for terms that should always be blocked:
+
+    DEFAULT_BLACKLIST = [
+        "furry",
+        "cosplay",
+    ]
+
+Example:
+
+    python redgifs_downloader.py "https://www.redgifs.com/niches/femboy" --limit 100 --blacklist furry
+
+You can pass multiple command-line terms as comma-separated values:
+
+    python redgifs_downloader.py "https://www.redgifs.com/niches/femboy" --limit 100 --blacklist furry,cosplay
+
+Or repeat the option; these are added to `DEFAULT_BLACKLIST`:
+
+    python redgifs_downloader.py "https://www.redgifs.com/niches/femboy" --limit 100 --blacklist furry --blacklist cosplay
+
+You can also load blacklist terms from a text file:
+
+    python redgifs_downloader.py "https://www.redgifs.com/niches/femboy" --limit 100 --blacklist-file blacklist.txt
 
 ### Prefer SD instead of HD
 
@@ -175,7 +217,7 @@ By default, existing files are skipped.
 
 | Option | Description |
 | --- | --- |
-| `url` | RedGIFs watch, user, niche, search, or tag URL |
+| `url` | RedGIFs watch, user, niche, search, tag URL, or multiple comma/semicolon/pipe-separated niche slugs/URLs |
 | `-l`, `--limit` | Maximum number of videos to download |
 | `-o`, `--output-dir` | Directory to save videos into |
 | `--folder` | Override the automatic subfolder name |
@@ -186,6 +228,8 @@ By default, existing files are skipped.
 | `--overwrite` | Re-download files even if they already exist |
 | `--prefer {hd,sd}` | Prefer HD or SD video URLs |
 | `--order {top,hot,latest}` | Sort order for user, niche, and search URLs |
+| `--blacklist TAG[,TAG...]` | Skip videos whose tags contain a blacklist term |
+| `--blacklist-file FILE` | Load blacklist terms from a text file |
 | `-h`, `--help` | Show help message |
 
 ## Output Structure
