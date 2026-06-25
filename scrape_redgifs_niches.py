@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Scrape RedGIFs top/trending niches/tags into a JSON file.
+Scrape RedGIFs niches into a JSON file.
 
 This uses the same general approach as redgifs_downloader.py:
 - aiohttp
@@ -34,6 +34,7 @@ from aiohttp import ClientResponseError, ClientTimeout
 BASE_API = "https://api.redgifs.com/v2"
 TOKEN_URL = f"{BASE_API}/auth/temporary"
 EXPLORE_NICHES_URL = "https://www.redgifs.com/explore/niches"
+NICHES_API_URL = f"{BASE_API}/niches"
 
 HEADERS = {
     "User-Agent": (
@@ -90,6 +91,27 @@ def extract_items_from_payload(payload: Any) -> list[dict[str, Any]]:
             return [item for item in value if isinstance(item, dict)]
 
     return []
+
+
+def get_next_page(payload: Any, current_page: int) -> int | None:
+    """Infer the next page number from a RedGIFs paginated response."""
+    if not isinstance(payload, dict):
+        return None
+
+    pages = payload.get("pages")
+    if isinstance(pages, int) and current_page < pages:
+        return current_page + 1
+
+    page_info = payload.get("page")
+    if isinstance(page_info, dict):
+        total_pages = page_info.get("totalPages") or page_info.get("pages")
+        if isinstance(total_pages, int) and current_page < total_pages:
+            return current_page + 1
+
+    if extract_items_from_payload(payload):
+        return current_page + 1
+
+    return None
 
 
 def normalize_item(item: dict[str, Any], rank: int) -> dict[str, Any] | None:
@@ -214,6 +236,67 @@ class RedGifsClient:
                 raise
 
         raise RuntimeError(f"Failed API request after retries: {url}")
+
+
+async def get_all_niches(
+    client: RedGifsClient,
+    *,
+    limit: int | None,
+    page_size: int,
+) -> list[dict[str, Any]]:
+    """Fetch the paginated RedGIFs niche catalog."""
+    niches: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    page = 1
+
+    while True:
+        try:
+            payload = await client.api_get(
+                "/niches",
+                params={
+                    "count": page_size,
+                    "page": page,
+                },
+            )
+        except Exception as exc:
+            print(f"Could not fetch /niches page {page}: {exc}")
+            break
+
+        items = extract_items_from_payload(payload)
+        if not items:
+            break
+
+        if page == 1 and isinstance(payload, dict):
+            total = payload.get("total")
+            pages = payload.get("pages")
+            print(f"Using API endpoint: /niches ({total or 'unknown'} total)")
+            if pages:
+                print(f"Fetching up to {pages} page(s)...")
+
+        for item in items:
+            normalized = normalize_item(item, len(niches) + 1)
+
+            if not normalized:
+                continue
+
+            slug = normalized["slug"]
+
+            if slug in seen:
+                continue
+
+            seen.add(slug)
+            niches.append(normalized)
+
+            if limit is not None and len(niches) >= limit:
+                return niches
+
+        next_page = get_next_page(payload, page)
+        if not next_page or next_page <= page:
+            break
+
+        page = next_page
+
+    return niches
 
 
 async def get_trending_tags(client: RedGifsClient) -> list[dict[str, Any]]:
@@ -371,44 +454,52 @@ async def scrape_redgifs_niches(
     output: Path,
     limit: int | None,
     enrich: bool,
+    page_size: int,
 ) -> None:
     timeout = ClientTimeout(total=None, sock_connect=30, sock_read=120)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         client = RedGifsClient(session)
 
-        raw_tags = await get_trending_tags(client)
+        niches = await get_all_niches(client, limit=limit, page_size=page_size)
+        source_url = NICHES_API_URL
 
-        niches: list[dict[str, Any]] = []
-
-        if enrich and raw_tags:
-            print("Trying to enrich trending tags with niche search...")
-            niches = await search_niches_from_tags(client, raw_tags, limit=limit)
+        if niches:
+            print(f"Collected {len(niches)} niche(s) from /niches.")
 
         if not niches:
-            print("Using trending tags as niche-style entries...")
-            seen: set[str] = set()
+            raw_tags = await get_trending_tags(client)
 
-            for item in raw_tags:
-                normalized = normalize_item(item, len(niches) + 1)
+            if enrich and raw_tags:
+                print("Trying to enrich trending tags with niche search...")
+                niches = await search_niches_from_tags(client, raw_tags, limit=limit)
+                source_url = "https://api.redgifs.com/v2/niches/search"
 
-                if not normalized:
-                    continue
+            if not niches:
+                print("Using trending tags as niche-style entries...")
+                seen: set[str] = set()
 
-                slug = normalized["slug"]
+                for item in raw_tags:
+                    normalized = normalize_item(item, len(niches) + 1)
 
-                if slug in seen:
-                    continue
+                    if not normalized:
+                        continue
 
-                seen.add(slug)
-                niches.append(normalized)
+                    slug = normalized["slug"]
 
-                if limit is not None and len(niches) >= limit:
-                    break
+                    if slug in seen:
+                        continue
+
+                    seen.add(slug)
+                    niches.append(normalized)
+
+                    if limit is not None and len(niches) >= limit:
+                        break
 
         if not niches:
             print("Trying HTML fallback from /explore/niches...")
             fallback_items = await scan_explore_page_for_niche_links(session)
+            source_url = EXPLORE_NICHES_URL
 
             for item in fallback_items:
                 normalized = normalize_item(item, len(niches) + 1)
@@ -420,7 +511,7 @@ async def scrape_redgifs_niches(
                     break
 
     data = {
-        "source_url": EXPLORE_NICHES_URL,
+        "source_url": source_url,
         "scraped_at": datetime.now(timezone.utc).isoformat(),
         "count": len(niches),
         "niches": niches,
@@ -436,7 +527,7 @@ async def scrape_redgifs_niches(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scrape RedGIFs top/trending tags or niches into JSON.",
+        description="Scrape RedGIFs niches into JSON.",
     )
 
     parser.add_argument(
@@ -457,13 +548,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--no-enrich",
         action="store_true",
-        help="Do not try niche-search enrichment; save trending tags directly",
+        help="Do not try niche-search enrichment if the main niche catalog fails",
+    )
+
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=100,
+        help="API page size for niche catalog fetching",
     )
 
     args = parser.parse_args(argv)
 
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be a positive integer")
+
+    if args.page_size < 1:
+        parser.error("--page-size must be at least 1")
 
     return args
 
@@ -476,6 +577,7 @@ def main(argv: list[str] | None = None) -> int:
             output=Path(args.output),
             limit=args.limit,
             enrich=not args.no_enrich,
+            page_size=args.page_size,
         )
     )
 
